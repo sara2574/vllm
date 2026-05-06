@@ -176,6 +176,12 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_TRITON_MLA_SPARSE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
+    VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1431,6 +1437,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # Portable sparse-MLA fallback controls for SM12x DeepSeek-V4.
+    # Unset means auto-select on platforms without a native sparse MLA kernel.
+    "VLLM_TRITON_MLA_SPARSE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE") is None
+        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE", "0")))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE") is None
+        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "0")))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE": lambda: bool(
+        int(os.getenv("VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE", "0"))
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
