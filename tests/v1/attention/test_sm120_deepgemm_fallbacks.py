@@ -8,6 +8,7 @@ import vllm.utils.deep_gemm as deep_gemm_utils
 from vllm.model_executor.layers.sparse_attn_indexer import (
     _decode_logits_width,
     _decode_topk_logits_width,
+    _sparse_indexer_requires_deep_gemm,
 )
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -124,6 +125,27 @@ def test_decode_topk_logits_width_keeps_topk_kernel_width():
     assert _decode_topk_logits_width(262144, 128, 512) == 512
     assert _decode_topk_logits_width(300, 128, 512) == 300
     assert _decode_topk_logits_width(0, 128, 512) == 0
+
+
+def test_sparse_indexer_requires_deep_gemm_for_sm120_fp4_cache(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda family: family == 120,
+    )
+
+    assert not _sparse_indexer_requires_deep_gemm(use_fp4_cache=False)
+    assert _sparse_indexer_requires_deep_gemm(use_fp4_cache=True)
+
+
+def test_sparse_indexer_requires_deep_gemm_for_other_cuda_arches(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: False
+    )
+
+    assert _sparse_indexer_requires_deep_gemm(use_fp4_cache=False)
 
 
 @pytest.mark.skipif(
