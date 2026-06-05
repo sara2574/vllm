@@ -800,6 +800,20 @@ class DelegatingParser(Parser):
         enable_auto_tools: bool = False,
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
         reasoning, content = self.extract_reasoning(model_output, request)
+        # Thinking-disabled GLM-style outputs may contain native tool-call
+        # markup without a </think> boundary. In that case a thinking parser
+        # such as deepseek_r1 returns the whole output as reasoning and no
+        # content, so route the text to the tool parser instead of leaking raw
+        # <tool_call> markup into reasoning/content.
+        tool_start_token = getattr(self._tool_parser, "tool_call_start_token", None)
+        if (
+            content is None
+            and reasoning
+            and tool_start_token
+            and tool_start_token in reasoning
+        ):
+            content = reasoning
+            reasoning = None
         tool_calls, content = self._extract_tool_calls(
             content=content,
             request=request,
@@ -849,6 +863,30 @@ class DelegatingParser(Parser):
                 )
                 delta_text = current_text
                 delta_token_ids = current_token_ids
+
+            # Some thinking-capable models can be configured with thinking
+            # disabled and then emit native tool-call markup without any
+            # preceding </think> token. Reasoning parsers such as deepseek_r1
+            # otherwise keep the stream in the reasoning phase forever, which
+            # leaks raw tool-call text as reasoning/content and prevents the
+            # tool parser from producing OpenAI tool_call deltas. If the
+            # wrapped tool parser exposes a structural tool-call start token and
+            # it appears in the accumulated no-think text, start tool parsing at
+            # that token immediately.
+            if self._tool_parser and not state.reasoning_ended:
+                tool_start_token = getattr(
+                    self._tool_parser, "tool_call_start_token", None
+                )
+                if tool_start_token and tool_start_token in current_text:
+                    tool_start = current_text.find(tool_start_token)
+                    state.reasoning_ended = True
+                    current_text = current_text[tool_start:]
+                    current_token_ids = []
+                    delta_text = current_text
+                    delta_token_ids = []
+                    if delta_message is not None:
+                        delta_message.reasoning = None
+                        delta_message.content = None
 
         # Tool call extraction
         if self._in_tool_call_phase(state):
