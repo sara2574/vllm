@@ -11,7 +11,6 @@ The fix streams string values incrementally as they arrive, providing a true
 streaming experience for long content.
 """
 
-import ast
 import json
 from collections.abc import Sequence
 from typing import Any
@@ -42,6 +41,7 @@ from vllm.tool_parsers.utils import (
     extract_types_from_schema,
     find_tool_properties,
     partial_tag_overlap,
+    safe_literal_eval,
 )
 
 logger = init_logger(__name__)
@@ -56,6 +56,17 @@ class Glm4MoeModelToolParser(ToolParser):
     """
 
     supports_required_and_named = False
+
+    # Expose GLM XML delimiters as class attributes so the unified
+    # reasoning/tool parser can detect tool-call output before an instance has
+    # been created (non-streaming) and while reasoning is still open
+    # (streaming with thinking disabled).
+    tool_call_start_token: str = "<tool_call>"
+    tool_call_end_token: str = "</tool_call>"
+    arg_key_start: str = "<arg_key>"
+    arg_key_end: str = "</arg_key>"
+    arg_val_start: str = "<arg_value>"
+    arg_val_end: str = "</arg_value>"
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
@@ -110,7 +121,7 @@ class Glm4MoeModelToolParser(ToolParser):
             pass
 
         try:
-            return ast.literal_eval(value)
+            return safe_literal_eval(value)
         except (ValueError, SyntaxError):
             pass
 
@@ -304,16 +315,24 @@ class Glm4MoeModelToolParser(ToolParser):
                 break
         return results
 
-    def _extract_tool_name_from_region(self, inner_text: str) -> str | None:
+    def _extract_tool_name_from_region(
+        self, inner_text: str, is_complete: bool = False
+    ) -> str | None:
         """Extract the tool name from the beginning of a tool-call region.
 
-        The name is everything before the first ``\\n`` or ``<arg_key>``.
-        Returns ``None`` if the name hasn't fully arrived yet.
+        The name is everything before the first ``\n`` or ``<arg_key>``.
+        For a completed zero-argument GLM-4.7 call, the entire inner text is
+        the function name (``<tool_call>name</tool_call>``). Return ``None``
+        while an undelimited name is still streaming so we do not emit a
+        partial function name.
         """
         nl = inner_text.find("\n")
         ak = inner_text.find(self.arg_key_start)
         candidates = [i for i in [nl, ak] if i != -1]
         if not candidates:
+            if is_complete:
+                name = inner_text.strip()
+                return name if name else None
             return None
         cut = min(candidates)
         name = inner_text[:cut].strip()
@@ -449,7 +468,7 @@ class Glm4MoeModelToolParser(ToolParser):
             self._ensure_tool_state_for(i)
 
             # Extract tool name
-            tool_name = self._extract_tool_name_from_region(inner_text)
+            tool_name = self._extract_tool_name_from_region(inner_text, is_complete)
             if not tool_name:
                 break
 

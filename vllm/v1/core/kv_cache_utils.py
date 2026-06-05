@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
@@ -326,6 +327,27 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += 1
 
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Put a list of blocks at the front of the free list."""
+        if len(blocks) == 0:
+            return
+
+        first_block = self.fake_free_list_head.next_free_block
+        assert first_block is not None, (
+            "next_free_block of fake_free_list_head should always exist"
+        )
+
+        prev_block = self.fake_free_list_head
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+
+        prev_block.next_free_block = first_block
+        first_block.prev_free_block = prev_block
+
+        self.num_free_blocks += len(blocks)
+
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
 
@@ -576,8 +598,9 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
-      group's block size — context parallelism is not supported here.
+      the resolved KV cache group's block size * dcp * pcp. Multiple groups:
+      LCM of every group's block size — context parallelism is not supported
+      here.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.hash_block_size`` override if set, else the GCD of group
@@ -591,8 +614,17 @@ def resolve_kv_cache_block_sizes(
     pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:  # Single group: block_size * dcp * pcp
-        bs = cache_config.block_size * dcp * pcp
+    if len(groups) <= 1:
+        # Single group: use the resolved group's KV cache block size rather
+        # than the generic cache_config.block_size. Mamba-only models with
+        # prefix caching disabled can resolve the group block size from
+        # mamba_block_size while cache_config.block_size remains the attention
+        # block size; the scheduler alignment must be divisible by the actual
+        # group's block size.
+        group_block_size = (
+            groups[0].kv_cache_spec.block_size if groups else cache_config.block_size
+        )
+        bs = group_block_size * dcp * pcp
         return bs, bs
 
     if dcp != 1 or pcp != 1:
@@ -1991,6 +2023,9 @@ def get_kv_cache_configs(
                     "across workers. This is not supported yet."
                 )
 
+    # Check if the KV cache specs are registered correctly.
+    # This is to prevent that some layers are initialized with unregistered specs.
+    KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.

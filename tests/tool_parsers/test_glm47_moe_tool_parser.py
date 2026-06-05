@@ -13,6 +13,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
     FunctionDefinition,
 )
+from vllm.parser.abstract_parser import DelegatingParser
+from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.tokenizers import get_tokenizer
 from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
 
@@ -174,3 +176,213 @@ class TestGlm47Streaming:
             )
         args = json.loads(glm47_tool_parser.prev_tool_call_arr[0]["arguments"])
         assert args["city"] == "Beijing"
+
+
+class _DummyTokenizer:
+    def get_vocab(self):
+        return {
+            "<think>": 1,
+            "</think>": 2,
+            "<tool_call>": 3,
+            "</tool_call>": 4,
+        }
+
+
+class _Glm47DeepSeekParser(DelegatingParser):
+    reasoning_parser_cls = DeepSeekR1ReasoningParser
+    tool_parser_cls = Glm47MoeModelToolParser
+
+
+@pytest.fixture
+def write_tools():
+    return [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="write",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            ),
+        ),
+    ]
+
+
+@pytest.fixture
+def write_request(write_tools) -> ChatCompletionRequest:
+    request = Mock(spec=ChatCompletionRequest)
+    request.tools = write_tools
+    request.tool_choice = "auto"
+    return request
+
+
+def test_thinking_disabled_non_streaming_routes_tool_markup_to_glm47_parser(
+    write_tools, write_request
+):
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=write_tools)
+    raw = (
+        "<tool_call>write"
+        "<arg_key>file_path</arg_key><arg_value>/tmp/x.txt</arg_value>"
+        "<arg_key>content</arg_key><arg_value>hello</arg_value>"
+        "</tool_call>"
+    )
+
+    reasoning, content, tool_calls = parser.parse(
+        raw, write_request, enable_auto_tools=True
+    )
+
+    assert reasoning is None
+    assert content is None
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "write"
+    assert json.loads(tool_calls[0].arguments) == {
+        "file_path": "/tmp/x.txt",
+        "content": "hello",
+    }
+
+
+def test_thinking_disabled_streaming_emits_tool_call_delta_not_reasoning(
+    write_tools, write_request
+):
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=write_tools)
+    raw = (
+        "<tool_call>write"
+        "<arg_key>file_path</arg_key><arg_value>/tmp/x.txt</arg_value>"
+        "</tool_call>"
+    )
+
+    delta = parser.parse_delta(
+        delta_text=raw,
+        delta_token_ids=[],
+        request=write_request,
+        prompt_token_ids=[],
+        finished=True,
+    )
+
+    assert delta is not None
+    assert delta.reasoning is None
+    assert delta.content is None
+    assert delta.tool_calls
+    function_payloads = [tc.function for tc in delta.tool_calls]
+    assert any(payload.get("name") == "write" for payload in function_payloads)
+    combined_args = "".join(
+        payload.get("arguments") or "" for payload in function_payloads
+    )
+    assert json.loads(combined_args) == {"file_path": "/tmp/x.txt"}
+
+
+def test_thinking_disabled_non_streaming_does_not_reroute_without_tools():
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=[])
+    request = Mock(spec=ChatCompletionRequest)
+    request.tools = []
+    request.tool_choice = "none"
+    raw = "private reasoning mentions <tool_call>literally"
+
+    reasoning, content, tool_calls = parser.parse(raw, request, enable_auto_tools=True)
+
+    assert reasoning == raw
+    assert content is None
+    assert tool_calls == []
+
+
+def test_thinking_disabled_streaming_preserves_prefix_content(
+    write_tools, write_request
+):
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=write_tools)
+    raw = (
+        "Checking.<tool_call>write"
+        "<arg_key>file_path</arg_key><arg_value>/tmp/x.txt</arg_value>"
+        "</tool_call>"
+    )
+
+    delta = parser.parse_delta(
+        delta_text=raw,
+        delta_token_ids=[],
+        request=write_request,
+        prompt_token_ids=[],
+        finished=True,
+    )
+
+    assert delta is not None
+    assert delta.reasoning is None
+    assert delta.content == "Checking."
+    assert delta.tool_calls
+    function_payloads = [tc.function for tc in delta.tool_calls]
+    assert any(payload.get("name") == "write" for payload in function_payloads)
+    combined_args = "".join(
+        payload.get("arguments") or "" for payload in function_payloads
+    )
+    assert json.loads(combined_args) == {"file_path": "/tmp/x.txt"}
+
+
+def test_split_streaming_tool_start_token_is_buffered_not_leaked(
+    write_tools, write_request
+):
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=write_tools)
+    chunks = [
+        "<",
+        "tool",
+        "_call>write",
+        "<arg_key>file_path</arg_key><arg_value>/tmp/x.txt</arg_value>",
+        "</tool_call>",
+    ]
+
+    deltas = []
+    for idx, chunk in enumerate(chunks):
+        deltas.append(
+            parser.parse_delta(
+                delta_text=chunk,
+                delta_token_ids=[],
+                request=write_request,
+                prompt_token_ids=[] if idx == 0 else None,
+                finished=idx == len(chunks) - 1,
+            )
+        )
+
+    leaked_text = "".join(
+        (delta.reasoning or "") + (delta.content or "")
+        for delta in deltas
+        if delta is not None
+    )
+    assert "<tool" not in leaked_text
+
+    tool_call_deltas = [
+        tc for delta in deltas if delta and delta.tool_calls for tc in delta.tool_calls
+    ]
+    assert tool_call_deltas
+    function_payloads = [tc.function for tc in tool_call_deltas]
+    assert any(payload.get("name") == "write" for payload in function_payloads)
+    combined_args = "".join(
+        payload.get("arguments") or "" for payload in function_payloads
+    )
+    assert json.loads(combined_args) == {"file_path": "/tmp/x.txt"}
+
+
+def test_streaming_zero_argument_glm47_call_emits_name(glm47_tool_parser, mock_request):
+    _reset(glm47_tool_parser)
+    current_text = "<tool_call>get_current_date</tool_call>"
+
+    delta = glm47_tool_parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=current_text,
+        delta_text=current_text,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+
+    assert delta is not None
+    assert delta.tool_calls
+    function_payloads = [tc.function for tc in delta.tool_calls]
+    assert any(
+        payload.get("name") == "get_current_date" for payload in function_payloads
+    )
+    combined_args = "".join(
+        payload.get("arguments") or "" for payload in function_payloads
+    )
+    assert json.loads(combined_args) == {}
