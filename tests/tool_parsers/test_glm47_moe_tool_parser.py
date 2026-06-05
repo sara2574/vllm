@@ -275,6 +275,50 @@ def test_thinking_disabled_streaming_emits_tool_call_delta_not_reasoning(
     assert json.loads(combined_args) == {"file_path": "/tmp/x.txt"}
 
 
+def test_thinking_disabled_non_streaming_does_not_reroute_without_tools():
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=[])
+    request = Mock(spec=ChatCompletionRequest)
+    request.tools = []
+    request.tool_choice = "none"
+    raw = "private reasoning mentions <tool_call>literally"
+
+    reasoning, content, tool_calls = parser.parse(raw, request, enable_auto_tools=True)
+
+    assert reasoning == raw
+    assert content is None
+    assert tool_calls == []
+
+
+def test_thinking_disabled_streaming_preserves_prefix_content(
+    write_tools, write_request
+):
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=write_tools)
+    raw = (
+        "Checking.<tool_call>write"
+        "<arg_key>file_path</arg_key><arg_value>/tmp/x.txt</arg_value>"
+        "</tool_call>"
+    )
+
+    delta = parser.parse_delta(
+        delta_text=raw,
+        delta_token_ids=[],
+        request=write_request,
+        prompt_token_ids=[],
+        finished=True,
+    )
+
+    assert delta is not None
+    assert delta.reasoning is None
+    assert delta.content == "Checking."
+    assert delta.tool_calls
+    function_payloads = [tc.function for tc in delta.tool_calls]
+    assert any(payload.get("name") == "write" for payload in function_payloads)
+    combined_args = "".join(
+        payload.get("arguments") or "" for payload in function_payloads
+    )
+    assert json.loads(combined_args) == {"file_path": "/tmp/x.txt"}
+
+
 def test_split_streaming_tool_start_token_is_buffered_not_leaked(
     write_tools, write_request
 ):

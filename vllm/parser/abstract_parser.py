@@ -779,6 +779,53 @@ class DelegatingParser(Parser):
             return False
         return state.reasoning_ended
 
+    def _tool_parsing_is_active(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        enable_auto_tools: bool | None,
+    ) -> bool:
+        """Whether this request can legitimately route text to tool parsing."""
+        if self._tool_parser is None or request.tool_choice == "none":
+            return False
+
+        if request.tool_choice and isinstance(
+            request.tool_choice,
+            (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+        ):
+            return True
+        if request.tool_choice == "required":
+            return True
+
+        has_tools = bool(getattr(request, "tools", None))
+        if not has_tools:
+            return False
+
+        if enable_auto_tools is False:
+            return False
+        return request.tool_choice == "auto" or request.tool_choice is None
+
+    def _reasoning_start_seen(
+        self,
+        text: str,
+        token_ids: Sequence[int] | None = None,
+    ) -> bool:
+        parser = self._reasoning_parser
+        if parser is None:
+            return False
+
+        start_token = getattr(parser, "start_token", None) or getattr(
+            parser, "reasoning_start_str", None
+        )
+        if start_token and start_token in text:
+            return True
+
+        start_token_id = getattr(parser, "start_token_id", None)
+        return (
+            start_token_id is not None
+            and token_ids is not None
+            and start_token_id in token_ids
+        )
+
     def _append_unstreamed_tool_args(
         self,
         delta_message: DeltaMessage | None,
@@ -838,6 +885,8 @@ class DelegatingParser(Parser):
             and reasoning
             and tool_start_token
             and tool_start_token in reasoning
+            and self._tool_parsing_is_active(request, enable_auto_tools)
+            and not self._reasoning_start_seen(model_output)
         ):
             content = reasoning
             reasoning = None
@@ -900,12 +949,23 @@ class DelegatingParser(Parser):
             # wrapped tool parser exposes a structural tool-call start token and
             # it appears in the accumulated no-think text, start tool parsing at
             # that token immediately.
-            if self._tool_parser and not state.reasoning_ended:
+            if (
+                self._tool_parser
+                and not state.reasoning_ended
+                and self._tool_parsing_is_active(request, enable_auto_tools=None)
+                and not self._reasoning_start_seen(current_text, current_token_ids)
+            ):
                 tool_start_token = getattr(
                     self._tool_parser, "tool_call_start_token", None
                 )
                 if tool_start_token and tool_start_token in current_text:
                     tool_start = current_text.find(tool_start_token)
+                    prefix_delta = ""
+                    if tool_start > len(state.previous_text):
+                        prefix_delta = current_text[
+                            len(state.previous_text) : tool_start
+                        ]
+
                     state.reasoning_ended = True
                     current_text = current_text[tool_start:]
                     current_token_ids = []
@@ -913,7 +973,9 @@ class DelegatingParser(Parser):
                     delta_token_ids = []
                     if delta_message is not None:
                         delta_message.reasoning = None
-                        delta_message.content = None
+                        delta_message.content = prefix_delta or None
+                    elif prefix_delta:
+                        delta_message = DeltaMessage(content=prefix_delta)
                 elif tool_start_token:
                     # Keep split tool-call delimiters buffered while we are
                     # still in the no-think reasoning phase. Without this,
@@ -925,6 +987,11 @@ class DelegatingParser(Parser):
                     # once the full start token arrives.
                     overlap = partial_tag_overlap(current_text, tool_start_token)
                     delta_message = self._trim_delta_text_suffix(delta_message, overlap)
+                    if delta_message and delta_message.reasoning:
+                        delta_message.content = (
+                            delta_message.content or ""
+                        ) + delta_message.reasoning
+                        delta_message.reasoning = None
 
         # Tool call extraction
         if self._in_tool_call_phase(state):
@@ -935,9 +1002,10 @@ class DelegatingParser(Parser):
                 delta_text = current_text
                 delta_token_ids = current_token_ids
 
-            # A boundary delta may carry both reasoning and tool call,
-            # save it before the tool parser overwrites delta_message.
-            reasoning = delta_message.reasoning if delta_message else None
+            # A boundary delta may carry both content/reasoning and tool
+            # calls; save it before the tool parser overwrites delta_message.
+            prefix_content = delta_message.content if delta_message else None
+            prefix_reasoning = delta_message.reasoning if delta_message else None
             delta_message, state.function_name_returned = (
                 self._extract_tool_calls_streaming(
                     previous_text=state.previous_text,
@@ -952,10 +1020,15 @@ class DelegatingParser(Parser):
                     function_name_returned=state.function_name_returned,
                 )
             )
-            if reasoning:
+            if prefix_content or prefix_reasoning:
                 if not delta_message:
                     delta_message = DeltaMessage()
-                delta_message.reasoning = reasoning
+                if prefix_content:
+                    delta_message.content = prefix_content + (
+                        delta_message.content or ""
+                    )
+                if prefix_reasoning:
+                    delta_message.reasoning = prefix_reasoning
 
             if (
                 delta_message
