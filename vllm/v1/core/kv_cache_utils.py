@@ -598,8 +598,9 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
-      group's block size — context parallelism is not supported here.
+      the resolved KV cache group's block size * dcp * pcp. Multiple groups:
+      LCM of every group's block size — context parallelism is not supported
+      here.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.hash_block_size`` override if set, else the GCD of group
@@ -613,8 +614,17 @@ def resolve_kv_cache_block_sizes(
     pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:  # Single group: block_size * dcp * pcp
-        bs = cache_config.block_size * dcp * pcp
+    if len(groups) <= 1:
+        # Single group: use the resolved group's KV cache block size rather
+        # than the generic cache_config.block_size. Mamba-only models with
+        # prefix caching disabled can resolve the group block size from
+        # mamba_block_size while cache_config.block_size remains the attention
+        # block size; the scheduler alignment must be divisible by the actual
+        # group's block size.
+        group_block_size = (
+            groups[0].kv_cache_spec.block_size if groups else cache_config.block_size
+        )
+        bs = group_block_size * dcp * pcp
         return bs, bs
 
     if dcp != 1 or pcp != 1:
