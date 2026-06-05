@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import contextlib
 import io
+import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -12,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Final
 import numpy as np
 import pybase64 as base64
 from fastapi import Request
+from pydantic import TypeAdapter, ValidationError
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
@@ -41,6 +44,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ErrorResponse,
     FunctionCall,
+    FunctionDefinition,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ToolCall,
@@ -1065,6 +1069,38 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning = None
                 content = output.text
                 tool_calls = []
+
+            if parser is None and isinstance(
+                request.tool_choice, ChatCompletionNamedToolChoiceParam
+            ):
+                # Preserve forced named tool choice when no unified parser is
+                # configured. Older serving code treated the raw model output
+                # as the forced tool's argument string instead of returning an
+                # empty ``tool_calls`` list.
+                tool_calls = [
+                    FunctionCall(
+                        name=request.tool_choice.function.name,
+                        arguments=content or "",
+                    )
+                ]
+                content = None
+            elif parser is None and request.tool_choice == "required":
+                # Required tool choice can be emitted as a JSON list of
+                # FunctionDefinition objects even when auto tool parsing is
+                # disabled. Keep that fallback independent of ``tool_parser``.
+                required_tool_calls = []
+                with contextlib.suppress(ValidationError):
+                    required_tool_calls = TypeAdapter(
+                        list[FunctionDefinition]
+                    ).validate_json(content or "")
+                tool_calls = [
+                    FunctionCall(
+                        name=tool_call.name,
+                        arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
+                    )
+                    for tool_call in required_tool_calls
+                ]
+                content = None
 
             auto_tools_called = False
             if is_mistral_tokenizer(tokenizer):

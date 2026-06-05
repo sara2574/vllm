@@ -42,6 +42,7 @@ from vllm.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
 )
+from vllm.tool_parsers.utils import partial_tag_overlap
 from vllm.utils import random_uuid
 from vllm.utils.mistral import is_mistral_tool_parser
 
@@ -793,6 +794,32 @@ class DelegatingParser(Parser):
                 last_tc.function.arguments or ""
             ) + self._tool_parser.get_remaining_unstreamed_args()
 
+    def _trim_delta_text_suffix(
+        self,
+        delta_message: DeltaMessage | None,
+        suffix_len: int,
+    ) -> DeltaMessage | None:
+        """Suppress a text suffix that must remain buffered for later parsing."""
+        if delta_message is None or suffix_len <= 0:
+            return delta_message
+
+        remaining = suffix_len
+        for field_name in ("content", "reasoning"):
+            text = getattr(delta_message, field_name, None)
+            if not text or remaining <= 0:
+                continue
+            trim_len = min(len(text), remaining)
+            setattr(delta_message, field_name, text[:-trim_len] or None)
+            remaining -= trim_len
+
+        if (
+            not delta_message.reasoning
+            and not delta_message.content
+            and not delta_message.tool_calls
+        ):
+            return None
+        return delta_message
+
     def parse(
         self,
         model_output: str,
@@ -887,6 +914,17 @@ class DelegatingParser(Parser):
                     if delta_message is not None:
                         delta_message.reasoning = None
                         delta_message.content = None
+                elif tool_start_token:
+                    # Keep split tool-call delimiters buffered while we are
+                    # still in the no-think reasoning phase. Without this,
+                    # chunks such as "<" then "tool" then "_call>" get
+                    # emitted as reasoning before the full structural token is
+                    # visible to the tool parser. ``previous_text`` is updated
+                    # to the full accumulated text below, so suppressing the
+                    # overlapping suffix here does not discard it; it is parsed
+                    # once the full start token arrives.
+                    overlap = partial_tag_overlap(current_text, tool_start_token)
+                    delta_message = self._trim_delta_text_suffix(delta_message, overlap)
 
         # Tool call extraction
         if self._in_tool_call_phase(state):

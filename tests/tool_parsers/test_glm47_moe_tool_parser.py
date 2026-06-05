@@ -13,7 +13,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
     FunctionDefinition,
 )
-from vllm.parser.abstract_parser import _WrappedParser
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.tokenizers import get_tokenizer
 from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
@@ -188,7 +188,7 @@ class _DummyTokenizer:
         }
 
 
-class _Glm47DeepSeekParser(_WrappedParser):
+class _Glm47DeepSeekParser(DelegatingParser):
     reasoning_parser_cls = DeepSeekR1ReasoningParser
     tool_parser_cls = Glm47MoeModelToolParser
 
@@ -268,6 +268,49 @@ def test_thinking_disabled_streaming_emits_tool_call_delta_not_reasoning(
     assert delta.content is None
     assert delta.tool_calls
     function_payloads = [tc.function for tc in delta.tool_calls]
+    assert any(payload.get("name") == "write" for payload in function_payloads)
+    combined_args = "".join(
+        payload.get("arguments") or "" for payload in function_payloads
+    )
+    assert json.loads(combined_args) == {"file_path": "/tmp/x.txt"}
+
+
+def test_split_streaming_tool_start_token_is_buffered_not_leaked(
+    write_tools, write_request
+):
+    parser = _Glm47DeepSeekParser(_DummyTokenizer(), tools=write_tools)
+    chunks = [
+        "<",
+        "tool",
+        "_call>write",
+        "<arg_key>file_path</arg_key><arg_value>/tmp/x.txt</arg_value>",
+        "</tool_call>",
+    ]
+
+    deltas = []
+    for idx, chunk in enumerate(chunks):
+        deltas.append(
+            parser.parse_delta(
+                delta_text=chunk,
+                delta_token_ids=[],
+                request=write_request,
+                prompt_token_ids=[] if idx == 0 else None,
+                finished=idx == len(chunks) - 1,
+            )
+        )
+
+    leaked_text = "".join(
+        (delta.reasoning or "") + (delta.content or "")
+        for delta in deltas
+        if delta is not None
+    )
+    assert "<tool" not in leaked_text
+
+    tool_call_deltas = [
+        tc for delta in deltas if delta and delta.tool_calls for tc in delta.tool_calls
+    ]
+    assert tool_call_deltas
+    function_payloads = [tc.function for tc in tool_call_deltas]
     assert any(payload.get("name") == "write" for payload in function_payloads)
     combined_args = "".join(
         payload.get("arguments") or "" for payload in function_payloads
