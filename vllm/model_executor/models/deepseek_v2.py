@@ -875,6 +875,27 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
             return super().forward(input_)
 
 
+class DeepSeekV2SeparateQkvAProj(nn.Module):
+    """Runtime shim for checkpoints whose q_a/kv_a tensors must load separately."""
+
+    def __init__(
+        self,
+        q_a_proj: nn.Module,
+        kv_a_proj_with_mqa: nn.Module,
+    ) -> None:
+        super().__init__()
+        self.q_a_proj = q_a_proj
+        self.kv_a_proj_with_mqa = kv_a_proj_with_mqa
+
+    def forward(
+        self,
+        input_,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.nn.Parameter | None]:
+        q_a = self.q_a_proj(input_)[0]
+        kv_a = self.kv_a_proj_with_mqa(input_)[0]
+        return torch.cat((q_a, kv_a), dim=-1), None
+
+
 class DeepseekV2MLAAttention(nn.Module):
     """
     Main reference: DeepseekV2 paper, and FlashInfer Implementation
@@ -903,6 +924,25 @@ class DeepseekV2MLAAttention(nn.Module):
         input_size: int | None = None,
     ) -> None:
         super().__init__()
+        if getattr(config, "model_type", "") == "glm_moe_dsa":
+            config_qk_nope_head_dim = getattr(config, "qk_nope_head_dim", qk_nope_head_dim)
+            config_qk_head_dim = getattr(config, "qk_head_dim", 0)
+            config_qk_rope_head_dim = getattr(config, "qk_rope_head_dim", qk_rope_head_dim)
+            qk_nope_head_dim = config_qk_nope_head_dim
+            qk_rope_head_dim = (
+                config_qk_head_dim - config_qk_nope_head_dim
+                if config_qk_head_dim and config_qk_nope_head_dim
+                else config_qk_rope_head_dim
+            )
+            logger.warning(
+                "GLM DSA MLA dims normalized: qk_nope=%s qk_rope=%s "
+                "qk_head=%s kv_lora=%s q_lora=%s",
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                config_qk_head_dim,
+                kv_lora_rank,
+                q_lora_rank,
+            )
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -923,14 +963,39 @@ class DeepseekV2MLAAttention(nn.Module):
         # Use input_size for projection input dimensions if provided,
         # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)
         proj_input_size = input_size if input_size is not None else self.hidden_size
+        self.separate_qkv_a_proj = (
+            __import__("os").environ.get("GLM5_FORCE_DENSE") == "1"
+            and getattr(config, "model_type", "") == "glm_moe_dsa"
+            and self.q_lora_rank is not None
+        )
 
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
-                proj_input_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkv_a_proj",
-            )
+            if self.separate_qkv_a_proj:
+                self.q_a_proj = ReplicatedLinear(
+                    proj_input_size,
+                    self.q_lora_rank,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.q_a_proj",
+                )
+                self.kv_a_proj_with_mqa = ReplicatedLinear(
+                    proj_input_size,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.kv_a_proj_with_mqa",
+                )
+                self.fused_qkv_a_proj = DeepSeekV2SeparateQkvAProj(
+                    self.q_a_proj,
+                    self.kv_a_proj_with_mqa,
+                )
+            else:
+                self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
+                    proj_input_size,
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
         else:
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 proj_input_size,
@@ -996,7 +1061,7 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = hasattr(config, "index_topk") and __import__("os").environ.get("GLM5_FORCE_DENSE") != "1"
 
         _skip_topk = False
         if self.is_v32:
@@ -1229,7 +1294,7 @@ class DeepseekV2Model(nn.Module):
         self.device = current_platform.device_type
 
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = hasattr(config, "index_topk") and __import__("os").environ.get("GLM5_FORCE_DENSE") != "1"
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1359,6 +1424,10 @@ class DeepseekV2Model(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
+        separate_qkv_a_proj = (
+            __import__("os").environ.get("GLM5_FORCE_DENSE") == "1"
+            and getattr(self.config, "model_type", "") == "glm_moe_dsa"
+        )
         # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
         _pending_wk_fp8: dict = {}  # When WK is in FP8, we dequant to BF16 for fusion
         indexer_fused_mapping = [
@@ -1369,7 +1438,7 @@ class DeepseekV2Model(nn.Module):
 
         if self.use_mha:
             stacked_params_mapping.extend(mha_params_mapping)
-        else:
+        elif not separate_qkv_a_proj:
             stacked_params_mapping.extend(mla_params_mapping)
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1392,7 +1461,14 @@ class DeepseekV2Model(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            orig_name = name
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            # GLM5_FORCE_DENSE: when running a DSA model (glm_moe_dsa / DeepSeek-V3.2)
+            # as dense MLA on sm_121 (no sparse-attn backend exists), the indexer is
+            # not built — skip its weights to avoid a KeyError in params_dict.
+            if __import__("os").environ.get("GLM5_FORCE_DENSE") == "1" and ".indexer" in name:
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
@@ -1415,7 +1491,8 @@ class DeepseekV2Model(nn.Module):
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                needle = f".{weight_name}."
+                if needle not in name:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
@@ -1427,7 +1504,7 @@ class DeepseekV2Model(nn.Module):
                     continue
                 if is_fusion_moe_shared_experts_layer:
                     continue
-                name_mapped = name.replace(weight_name, param_name)
+                name_mapped = name.replace(needle, f".{param_name}.", 1)
 
                 # QKV fusion is optional, fall back to normal
                 # weight loading if it's not enabled
@@ -1447,7 +1524,22 @@ class DeepseekV2Model(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                try:
+                    weight_loader(param, loaded_weight, shard_id)
+                except Exception:
+                    logger.exception(
+                        "GLM5 dense load failed: orig_name=%s mapped_name=%s "
+                        "param_name=%s shard_id=%s loaded_shape=%s param_shape=%s "
+                        "param_type=%s",
+                        orig_name,
+                        name,
+                        param_name,
+                        shard_id,
+                        tuple(loaded_weight.shape),
+                        tuple(getattr(param, "shape", ())),
+                        type(param).__name__,
+                    )
+                    raise
                 break
             else:
                 is_expert_weight = False
@@ -1643,6 +1735,10 @@ class DeepseekV2ForCausalLM(
         # quant_method for relevant layers during initialization.
         self.fuse_qkv_a_proj = (
             hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
+            and not (
+                __import__("os").environ.get("GLM5_FORCE_DENSE") == "1"
+                and getattr(config, "model_type", "") == "glm_moe_dsa"
+            )
         )
         if self.fuse_qkv_a_proj:
             self.packed_modules_mapping["fused_qkv_a_proj"] = [

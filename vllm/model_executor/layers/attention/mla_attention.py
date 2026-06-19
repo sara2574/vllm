@@ -1318,12 +1318,19 @@ def get_mla_dims(model_config: ModelConfig) -> MLADims:
             v_head_dim=head_dim,
         )
 
+    qk_nope_head_dim = hf_text_config.qk_nope_head_dim
+    qk_rope_head_dim = hf_text_config.qk_rope_head_dim
+    if getattr(hf_text_config, "model_type", "") == "glm_moe_dsa":
+        qk_head_dim = getattr(hf_text_config, "qk_head_dim", 0)
+        if qk_head_dim and qk_nope_head_dim:
+            qk_rope_head_dim = qk_head_dim - qk_nope_head_dim
+
     # DeepseekV2/V3 style config
     return MLADims(
         q_lora_rank=getattr(hf_text_config, "q_lora_rank", None),
         kv_lora_rank=hf_text_config.kv_lora_rank,
-        qk_nope_head_dim=hf_text_config.qk_nope_head_dim,
-        qk_rope_head_dim=hf_text_config.qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=hf_text_config.v_head_dim,
     )
 
@@ -1473,6 +1480,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
+        self.mla_head_dim = self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim
         self.aot_schedule = current_platform.is_cuda()
 
         self.kv_cache_spec = kv_cache_spec
@@ -1509,7 +1517,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 (
                     self.chunked_prefill_workspace_size
                     + self.chunked_prefill_workspace_size // self.dcp_world_size,
-                    self.model_config.get_head_size(),
+                    self.mla_head_dim,
                 ),
                 dtype=self.model_config.dtype,
                 device=device,
@@ -1518,7 +1526,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.chunked_prefill_workspace = torch.empty(
                 (
                     self.chunked_prefill_workspace_size,
-                    self.model_config.get_head_size(),
+                    self.mla_head_dim,
                 ),
                 dtype=self.q_data_type,
                 device=device,
@@ -1830,6 +1838,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
             )
 
+        mla_dims = get_mla_dims(self.model_config)
+        head_dim = mla_dims.kv_lora_rank + mla_dims.qk_rope_head_dim
+
         attn_metadata = self.metadata_cls(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -1837,7 +1848,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             num_actual_tokens=num_tokens,
             query_start_loc=query_start_loc,
             slot_mapping=slot_mapping,
-            head_dim=self.model_config.get_head_size(),
+            head_dim=head_dim,
             # MLACommonMetadata Chunk prefill specific
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
