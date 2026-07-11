@@ -1,0 +1,103 @@
+--- orig/core/single_type_kv_cache_manager.py	2026-07-11 17:53:04.411274736 +0530
++++ tree/core/single_type_kv_cache_manager.py	2026-07-11 17:55:00.709808360 +0530
+@@ -5,6 +5,7 @@
+ from collections import defaultdict, deque
+ from collections.abc import Sequence
+ 
++from vllm import envs
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import (
+@@ -525,7 +526,12 @@
+         # range), so we must cap to the number of blocks that currently exist for
+         # this request.
+         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
+-        removed_blocks: list[KVCacheBlock] = []
++        # Backport of upstream vLLM #43447 (PLAT-4203): reuse skipped local
++        # blocks in order — uncached scratch blocks (no prefix-cache value) are
++        # recycled first, cached blocks (reusable prefix-cache value) last, so a
++        # future prefix-cache hit can still find the cached sliding-window tail.
++        removed_cached_blocks: list[KVCacheBlock] = []
++        removed_uncached_blocks: list[KVCacheBlock] = []
+         # Because the block starts from index 0, the num_skipped_block-th block
+         # corresponds to index num_skipped_blocks - 1.
+         for i in range(num_skipped_blocks - 1, -1, -1):
+@@ -534,9 +540,16 @@
+                 # should also have been set to null blocks by the previous calls
+                 # to this function.
+                 break
+-            removed_blocks.append(blocks[i])
++            if blocks[i].block_hash is None:
++                removed_uncached_blocks.append(blocks[i])
++            else:
++                removed_cached_blocks.append(blocks[i])
+             blocks[i] = self._null_block
+-        self.block_pool.free_blocks(removed_blocks)
++        # `prepend=True` makes uncached scratch blocks the next allocation
++        # candidates, while cached blocks stay behind them as best-effort
++        # prefix-cache entries.
++        self.block_pool.free_blocks(removed_cached_blocks)
++        self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
+ 
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+         """
+@@ -789,7 +802,23 @@
+         # disabled — otherwise prefix-cache hit rate drops to 0 %.
+         if getattr(self, "eagle_extra_cache_blocks", 0):
+             return None
+-        per_segment = alignment_tokens // self.block_size
++        # Backport of upstream vLLM #43447 (PLAT-4203), additive opt-in knob:
++        # VLLM_PREFIX_CACHE_RETENTION_INTERVAL, when a positive multiple of
++        # ``alignment_tokens``, widens the retained-tail segment to that interval
++        # so only one sliding-window tail is cached per interval (sparser
++        # retention -> less KV memory). Unset (default) or non-aligned keeps the
++        # existing dense per-alignment-segment behavior unchanged. `0` is treated
++        # as unset on this build (no separate replay-boundary pass exists here,
++        # so per-segment tails remain the conservative choice).
++        segment_tokens = alignment_tokens
++        retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
++        if (
++            retention_interval is not None
++            and retention_interval > 0
++            and retention_interval % alignment_tokens == 0
++        ):
++            segment_tokens = retention_interval
++        per_segment = segment_tokens // self.block_size
+         tail = cdiv(self.sliding_window - 1, self.block_size)
+         if tail >= per_segment:
+             return None
+@@ -835,6 +864,34 @@
+         """
+         return 0
+ 
++    def free(self, request_id: str) -> None:
++        # Backport of upstream vLLM #43447 (PLAT-4203): like
++        # remove_skipped_blocks, prepend uncached (scratch) blocks and append
++        # cached (prefix) blocks to the free queue so cached sliding-window
++        # prefix blocks survive across request boundaries and can serve a
++        # partial prefix-cache hit on the next turn instead of forcing a full
++        # re-prefill of the whole session.
++        #
++        # NOTE: blocks still carrying an extra "protected prompt block"
++        # reference (SlidingWindowMLAManager._protect_prompt_blocks, which
++        # touch()es boundary blocks) keep ref_cnt > 0 after this single
++        # decrement and are therefore NOT enqueued here — free_blocks only
++        # queues blocks whose ref_cnt reaches 0. This override only reorders
++        # eviction priority and never frees a still-referenced block, so it
++        # composes with the existing protected-prompt-block machinery.
++        req_blocks = self.req_to_blocks.pop(request_id, [])
++        if req_blocks:
++            cached_blocks: list[KVCacheBlock] = []
++            uncached_blocks: list[KVCacheBlock] = []
++            for block in reversed(req_blocks):
++                if block.block_hash is None:
++                    uncached_blocks.append(block)
++                else:
++                    cached_blocks.append(block)
++            self.block_pool.free_blocks(cached_blocks)
++            self.block_pool.free_blocks(uncached_blocks, prepend=True)
++        self.num_cached_block.pop(request_id, None)
++
+ 
+ class SlidingWindowMLAManager(SlidingWindowManager):
+     """KV cache manager for DeepSeek V4's sliding-window MLA cache.
