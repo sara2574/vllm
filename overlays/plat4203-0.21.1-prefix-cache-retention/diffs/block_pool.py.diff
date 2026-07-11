@@ -1,5 +1,5 @@
---- orig/core/block_pool.py	2026-07-11 17:53:04.411148758 +0530
-+++ tree/core/block_pool.py	2026-07-11 17:53:23.010571775 +0530
+--- orig/core/block_pool.py
++++ tree/core/block_pool.py
 @@ -416,21 +416,32 @@
              if self.metrics_collector:
                  self.metrics_collector.on_block_accessed(block)

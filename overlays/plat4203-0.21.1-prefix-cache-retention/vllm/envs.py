@@ -280,7 +280,6 @@ if TYPE_CHECKING:
     making the server model-name agnostic. Useful for proxy/gateway scenarios."""
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
-    VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_DSV4_SINGLE_EAGLE_DROP: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
@@ -1029,20 +1028,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # AsyncLLMEngine errors and stops serving requests
     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
         int(os.getenv("VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", "0"))
-    ),
-    # Retain local sliding-window KV checkpoints for prefix caching.
-    # Backport of upstream vLLM #43447 (PLAT-4203). Unset (default) preserves
-    # this build's existing dense sliding-window checkpointing behavior. `0`
-    # retains only the latest completed prompt boundary. Positive values retain
-    # checkpoints at the specified interval boundaries (must be a multiple of
-    # the hybrid scheduler/lcm block size). NOTE: on this build the sparse mask
-    # is intentionally bypassed when MTP/EAGLE speculative decoding is active
-    # (see SlidingWindowManager._cache_block_mask), so with MTP enabled this
-    # var is inert and the fix is the always-on free-queue eviction ordering.
-    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
-        int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
-        if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
-        else None
     ),
     # PLAT-4203 hitfix (default OFF). When set, the HybridKVCacheCoordinator
     # finds the longest COMMON prefix hit with no per-group EAGLE drop and then

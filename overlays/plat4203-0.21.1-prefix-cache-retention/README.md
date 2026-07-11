@@ -75,7 +75,9 @@ the harness distinguishes fix from bug).
 Set `VLLM_DSV4_SINGLE_EAGLE_DROP=1` on the scratch DSV4 pod. Run BOTH (a) the
 append-TTFT test AND (b) an OUTPUT-CORRECTNESS test (factual question over a large
 cached context — verify the answer is correct + non-empty; the earlier corruption
-was silent). Leave `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` unset.
+was silent). This overlay intentionally exposes no retention-interval knob: the
+production-proven path is the always-on free-queue ordering plus the gated
+single-drop re-query.
 
 ---
 
@@ -134,21 +136,17 @@ a still-referenced/protected block, since `free_blocks` only enqueues blocks who
      split when a request frees, so cached SWA prefix blocks survive across turns.
      Inherited by `SlidingWindowMLAManager` (the DSV4 class). Composes with
      `_protect_prompt_blocks` (protected blocks keep `ref_cnt > 0` and are skipped).
-   - `_cache_block_mask`: **additive, default-off** knob honoring
-     `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` to widen the retained-tail segment
-     (sparser retention → less KV memory) for the **non-MTP** path only. The
-     existing MTP-guard (`eagle_extra_cache_blocks` → `return None`) is preserved.
-4. **`vllm/envs.py`** — register `VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None`.
+4. **`vllm/envs.py`** — register only the default-off
+   `VLLM_DSV4_SINGLE_EAGLE_DROP` hitfix gate.
 
-## The env var, and what to set
+## Retention configuration contract
 
-`VLLM_PREFIX_CACHE_RETENTION_INTERVAL` only gates the sparse-retention **mask**,
-which on this build is **bypassed whenever MTP/EAGLE is active**. Production DSV4
-runs MTP (`num_speculative_tokens=2`), so **with MTP this var is inert** — leave it
-**UNSET**. The actual PLAT-4203 fix is the **always-on free-queue eviction ordering**
-(active by default, no env needed). Only set a positive value (a multiple of the
-hybrid `lcm_block_size`) if you disable MTP and want to trade prefix-hit density for
-KV memory.
+This overlay deliberately does **not** expose `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`.
+The diverged 0.21.1 tree cannot implement upstream's validated `0` latest-boundary,
+alignment-rejection, and MTP behavior without the dependency-complete retention
+backport. A partially inert or silently-fallback knob would be misleading. The
+production-proven retention fix here is the always-on free-queue eviction ordering
+(no configuration required); interval semantics remain an upstream-only capability.
 
 ## Residual risk (review before BENCH)
 

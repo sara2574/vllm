@@ -1,5 +1,5 @@
---- orig/core/kv_cache_utils.py	2026-07-11 17:53:04.411193422 +0530
-+++ tree/core/kv_cache_utils.py	2026-07-11 17:53:13.971454529 +0530
+--- orig/core/kv_cache_utils.py
++++ tree/core/kv_cache_utils.py
 @@ -326,6 +326,32 @@
  
          self.num_free_blocks += 1

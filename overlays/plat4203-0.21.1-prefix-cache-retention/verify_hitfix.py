@@ -182,6 +182,11 @@ for spec, group_ids, manager_cls in coord.attention_groups:
                 old_bug_exposed_null = True
 print(f"OLD del-truncate would expose NULL window tail? {old_bug_exposed_null} "
       f"(common={common}, reduced={reduced})")
+assert old_bug_exposed_null, (
+    "FAIL invariant-3 negative control: the reconstructed old del-truncate "
+    "path did not expose a NULL SWA window tail; this harness no longer "
+    "discriminates the P0 regression"
+)
 
 print("\nALL INVARIANTS PASS — Option-A re-derive returns window-correct blocks; "
       "P0 (SWA null-window corruption) is fixed.")

@@ -5,7 +5,6 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Sequence
 
-from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -802,23 +801,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # disabled — otherwise prefix-cache hit rate drops to 0 %.
         if getattr(self, "eagle_extra_cache_blocks", 0):
             return None
-        # Backport of upstream vLLM #43447 (PLAT-4203), additive opt-in knob:
-        # VLLM_PREFIX_CACHE_RETENTION_INTERVAL, when a positive multiple of
-        # ``alignment_tokens``, widens the retained-tail segment to that interval
-        # so only one sliding-window tail is cached per interval (sparser
-        # retention -> less KV memory). Unset (default) or non-aligned keeps the
-        # existing dense per-alignment-segment behavior unchanged. `0` is treated
-        # as unset on this build (no separate replay-boundary pass exists here,
-        # so per-segment tails remain the conservative choice).
-        segment_tokens = alignment_tokens
-        retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
-        if (
-            retention_interval is not None
-            and retention_interval > 0
-            and retention_interval % alignment_tokens == 0
-        ):
-            segment_tokens = retention_interval
-        per_segment = segment_tokens // self.block_size
+        per_segment = alignment_tokens // self.block_size
         tail = cdiv(self.sliding_window - 1, self.block_size)
         if tail >= per_segment:
             return None
