@@ -1,17 +1,8 @@
 --- orig/core/kv_cache_coordinator.py
 +++ tree/core/kv_cache_coordinator.py
-@@ -4,6 +4,7 @@
- from collections.abc import Sequence
- from math import lcm
- 
+@@ -6,0 +7 @@
 +import vllm.envs as envs
- from vllm.v1.core.block_pool import BlockPool
- from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
- from vllm.v1.core.kv_cache_utils import (
-@@ -553,6 +554,29 @@
-                 - A tuple of the cache hit blocks for each single type manager.
-                 - The number of tokens of the longest cache hit.
-         """
+@@ -555,0 +557,23 @@
 +        # PLAT-4203 hitfix (env-gated, default OFF): for DSV4-style multi-group
 +        # hybrids (>2 attention groups) with an EAGLE/MTP group, the per-group
 +        # EAGLE last-block drop inside the fixed-point loop cascades across the
@@ -35,13 +26,10 @@
 +            return self._find_longest_cache_hit_single_eagle_drop(
 +                block_hashes, max_cache_hit_length
 +            )
- 
-         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-             if kv_cache_spec.block_size == self.hash_block_size:
-@@ -635,6 +659,104 @@
- 
-         return tuple(
-             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
+@@ -634,0 +659,98 @@
++
++        return tuple(
++            blocks if blocks is not None else [] for blocks in hit_blocks_by_group
 +        ), hit_length
 +
 +    def _find_longest_cache_hit_single_eagle_drop(
@@ -137,9 +125,3 @@
 +        # SWA group's [NULL.., R..R] list so its window is correctly covered at
 +        # the new boundary — never truncate an SWA list in place (the P0 bug).
 +        hit_blocks_by_group, hit_length = _converge(reduced)
-+
-+        return tuple(
-+            blocks if blocks is not None else [] for blocks in hit_blocks_by_group
-         ), hit_length
- 
- 

@@ -1,17 +1,9 @@
 --- orig/envs.py
 +++ tree/envs.py
-@@ -280,6 +280,7 @@
-     making the server model-name agnostic. Useful for proxy/gateway scenarios."""
-     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
-     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+@@ -282,0 +283 @@
 +    VLLM_DSV4_SINGLE_EAGLE_DROP: bool = False
-     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
-     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
-     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
-@@ -1028,6 +1029,15 @@
-     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
-         int(os.getenv("VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", "0"))
-     ),
+@@ -1029,0 +1031,9 @@
++    ),
 +    # PLAT-4203 hitfix (default OFF). When set, the HybridKVCacheCoordinator
 +    # finds the longest COMMON prefix hit with no per-group EAGLE drop and then
 +    # applies a SINGLE lcm-aligned EAGLE drop after convergence (#40624 Option
@@ -20,7 +12,3 @@
 +    "VLLM_DSV4_SINGLE_EAGLE_DROP": lambda: (
 +        os.environ.get("VLLM_DSV4_SINGLE_EAGLE_DROP", "0").strip().lower()
 +        in ("1", "true")
-+    ),
-     # If the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN is set, it allows
-     # the user to specify a max sequence length greater than
-     # the max length derived from the model's config.json.

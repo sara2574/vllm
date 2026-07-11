@@ -1,9 +1,6 @@
 --- orig/core/kv_cache_utils.py
 +++ tree/core/kv_cache_utils.py
-@@ -326,6 +326,32 @@
- 
-         self.num_free_blocks += 1
- 
+@@ -328,0 +329,26 @@
 +    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
 +        """Put a list of blocks at the front of the free list.
 +
@@ -30,6 +27,3 @@
 +
 +        self.num_free_blocks += len(blocks)
 +
-     def append_n(self, blocks: list[KVCacheBlock]) -> None:
-         """Put a list of blocks back into the free list
- 
