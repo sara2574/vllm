@@ -5,14 +5,17 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.config import SpeculativeConfig
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
-def test_sparse_swa_reorder_threshold_matches_mtp_decode_threshold():
+def test_sparse_swa_reorder_threshold_matches_mtp_decode_threshold(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
     vllm_config = create_vllm_config(
+        model_name="hmellor/tiny-random-LlamaForCausalLM",
         block_size=256,
         hf_config_override={
             "sliding_window": 128,
